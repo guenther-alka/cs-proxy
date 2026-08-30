@@ -34,7 +34,7 @@ file webserver.pl uses, `_cfg/webserver/webserver.conf` (flat `key = value`,
 
 ```
 # --- webserver.pl (plain HTTP) ---
-http_port   = 8000            # HTTP only; the edge owns 80/443
+http_port   = 800             # HTTP only; the edge owns 80/443
 remote_http = proxy           # deny | allow | proxy
 listen_addr = 0.0.0.0
 default_url = /cgi-bin/admin.pl
@@ -53,7 +53,7 @@ proxy_compress = gzip
 - **Upstream port is derived from `http_port`** -- the proxy always follows
   webserver.pl's actual port; `proxy_upstream` overrides.
 - **Migration**: an old `http_port = 80` (or 8080) in webserver.conf is
-  rewritten to `8000` automatically on startup.
+  rewritten to `800` automatically on startup.
 - **remote_http** (webserver.pl): `deny` blocks remote HTTP (403), `allow`
   serves it directly, `proxy` (default) forwards remote HTTP to https at the
   `/` landing.
