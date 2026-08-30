@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-var version = "0.10"
+var version = "0.11"
 
 type Config struct {
 	Enabled     bool
@@ -46,17 +46,25 @@ type Config struct {
 	Compress string // "", "gzip", "gzip,brotli"
 
 	// Optional AI edge (local LLM reverse proxy, e.g. llama-server / Ollama).
-	// Listens on its own ports (ai_listen_http/https) and forwards everything
-	// to ai_upstream. Optional auth: ai_key (Bearer) + ai_allowed_ip (IP/CIDR).
+	// Listens on its own ports (ai_listen_http/https). Backends are selected by
+	// PATH PREFIX: ai_upstream = default (no prefix), ai_upstream_<name> is
+	// routed under /<name>/. Auth: ai_keys_file (Bearer, one key per line,
+	// hot-reloaded on change) + ai_allowed_ip (IP/CIDR). The edge key is
+	// stripped before the upstream hop; ai_upstream_key re-injects one.
 	AIEnabled     bool
 	AIListenAddr  string
 	AIListenHTTP  string
 	AIListenHTTPS string
 	AIUpstream    string
-	AIKey         string
+	AIUpstreams   map[string]string // ai_upstream_<name> -> URL (path prefix /<name>/)
+	AIUpstreamKey string            // optional Bearer injected to backends (edge key is stripped)
+	AIKeysFile    string            // one key per line; hot-reloaded on change
+	AIKeysExtra   []string          // deprecated ai_key values (still accepted, warn)
 	AIAllowedIP   string
 	AICertFile    string
 	AIKeyFile     string
+
+	ProxyAllowedIP string // GUI edge IP/CIDR allowlist (remote clients only; loopback always OK)
 }
 
 func defaultConfig() Config {
@@ -81,10 +89,14 @@ func defaultConfig() Config {
 		AIListenHTTP:  "0", // "0" = HTTP listener off
 		AIListenHTTPS: "8443",
 		AIUpstream:    "",
-		AIKey:         "",
+		AIUpstreams:   map[string]string{},
+		AIUpstreamKey: "",
+		AIKeysFile:    "",
 		AIAllowedIP:   "",
 		AICertFile:    "",
 		AIKeyFile:     "",
+
+		ProxyAllowedIP: "",
 	}
 }
 
@@ -179,14 +191,21 @@ func loadConfig(path string) (Config, error) {
 			cfg.AIListenHTTPS = v
 		case "ai_upstream":
 			cfg.AIUpstream = v
+		case "ai_keys_file":
+			cfg.AIKeysFile = v
+		case "ai_upstream_key":
+			cfg.AIUpstreamKey = v
 		case "ai_key":
-			cfg.AIKey = v
+			log.Printf("cs-proxy: WARNING ai_key is deprecated -- put the key(s) into ai_keys_file (default _cfg/cs-proxy.keys) instead\n")
+			cfg.AIKeysExtra = append(cfg.AIKeysExtra, v)
 		case "ai_allowed_ip":
 			cfg.AIAllowedIP = v
 		case "ai_cert":
 			cfg.AICertFile = v
 		case "ai_key_file":
 			cfg.AIKeyFile = v
+		case "proxy_allowed_ip":
+			cfg.ProxyAllowedIP = v
 		// shared keys (also used by webserver.pl)
 		case "http_port":
 			httpPort = v
@@ -219,6 +238,13 @@ func loadConfig(path string) (Config, error) {
 			case "compress":
 				cfg.Compress = strings.ToLower(v)
 			}
+		// named AI backends: ai_upstream_<name> -> routed under /<name>/
+		default:
+			if strings.HasPrefix(k, "ai_upstream_") && k != "ai_upstream_key" {
+				if name := strings.TrimPrefix(k, "ai_upstream_"); name != "" {
+					cfg.AIUpstreams[name] = v
+				}
+			}
 		}
 	}
 
@@ -232,7 +258,7 @@ func loadConfig(path string) (Config, error) {
 	if !filepath.IsAbs(cfg.Docroot) {
 		cfg.Docroot = filepath.Join(dir, cfg.Docroot)
 	}
-	for _, p := range []*string{&cfg.CertFile, &cfg.KeyFile, &cfg.AICertFile, &cfg.AIKeyFile} {
+	for _, p := range []*string{&cfg.CertFile, &cfg.KeyFile, &cfg.AICertFile, &cfg.AIKeyFile, &cfg.AIKeysFile} {
 		if *p != "" && !filepath.IsAbs(*p) {
 			*p = filepath.Join(dir, *p)
 		}
@@ -245,19 +271,22 @@ func main() {
 	var forward string
 	var listenHTTP, listenHTTPS, listenAddr string
 	var aiForward string
-	var aiHTTP, aiHTTPS, aiAddr, aiKey, aiAllowedIP string
+	var aiHTTP, aiHTTPS, aiAddr, aiAllowedIP, aiKeysFile string
+	var allowedProxy string
 	flag.StringVar(&cfgPath, "config", "", "path to config file (default: _cfg/webserver/webserver.conf next to the binary)")
 	flag.StringVar(&cfgPath, "conf", "", "alias for -config")
 	flag.StringVar(&forward, "forward", "", "upstream URL to reverse-proxy to (standalone/universal mode; overrides config)")
 	flag.StringVar(&listenHTTP, "http", "", "HTTP listen port (overrides config; standalone convenience)")
 	flag.StringVar(&listenHTTPS, "https", "", "HTTPS listen port (overrides config; standalone convenience)")
 	flag.StringVar(&listenAddr, "addr", "", "listen address (overrides config; standalone convenience)")
-	flag.StringVar(&aiForward, "ai-forward", "", "AI edge upstream URL (local LLM reverse proxy; enables the AI listener)")
+	flag.StringVar(&aiForward, "ai-forward", "", "AI edge default upstream URL (local LLM reverse proxy; enables the AI listener)")
 	flag.StringVar(&aiHTTP, "ai-http", "", "AI HTTP listen port (0 = off; overrides config)")
 	flag.StringVar(&aiHTTPS, "ai-https", "", "AI HTTPS listen port (0 = off; overrides config)")
 	flag.StringVar(&aiAddr, "ai-addr", "", "AI listen address (overrides config)")
-	flag.StringVar(&aiKey, "ai-key", "", "AI edge Bearer token (optional)")
-	flag.StringVar(&aiAllowedIP, "ai-allowed-ip", "", "AI edge client IP/CIDR allowlist (comma separated; optional)")
+	flag.StringVar(&aiKeysFile, "ai-keys-file", "", "AI edge Bearer key file (one key per line; hot-reloaded on change)")
+	flag.StringVar(&aiAllowedIP, "allowed-ai", "", "AI edge client IP/CIDR allowlist (alias: -ai-allowed-ip)")
+	flag.StringVar(&aiAllowedIP, "ai-allowed-ip", "", "alias for -allowed-ai")
+	flag.StringVar(&allowedProxy, "allowed-proxy", "", "web GUI client IP/CIDR allowlist (remote only; loopback always allowed)")
 	flag.Parse()
 
 	if cfgPath == "" {
@@ -306,14 +335,17 @@ func main() {
 	if aiAddr != "" {
 		cfg.AIListenAddr = aiAddr
 	}
-	if aiKey != "" {
-		cfg.AIKey = aiKey
+	if aiKeysFile != "" {
+		cfg.AIKeysFile = aiKeysFile
 	}
 	if aiAllowedIP != "" {
 		cfg.AIAllowedIP = aiAllowedIP
 	}
+	if allowedProxy != "" {
+		cfg.ProxyAllowedIP = allowedProxy
+	}
 
-	aiOn := cfg.AIEnabled && cfg.AIUpstream != ""
+	aiOn := cfg.AIEnabled && (cfg.AIUpstream != "" || len(cfg.AIUpstreams) > 0)
 	if !cfg.Enabled && !aiOn {
 		log.Printf("cs-proxy: proxy=off and ai=off in %s -- not starting (webserver.pl serves directly)\n", cfgPath)
 		return
@@ -361,15 +393,20 @@ func main() {
 
 	// ---- AI edge listeners (optional local LLM reverse proxy) ----
 	if aiOn {
-		edge := newAIEdge(cfg.AIUpstream)
-		edge.setKey(cfg.AIKey)
-		edge.setAllowed(cfg.AIAllowedIP)
+		edge := newAIEdge(cfg)
 		keyLog := "off"
-		if cfg.AIKey != "" {
+		if cfg.AIKeysFile != "" || len(cfg.AIKeysExtra) > 0 {
 			keyLog = "on"
 		}
-		log.Printf("cs-proxy %s: ai edge upstream=%s key=%s allowed_ip=%s\n",
-			version, cfg.AIUpstream, keyLog, cfg.AIAllowedIP)
+		backends := cfg.AIUpstream
+		for name := range cfg.AIUpstreams {
+			if backends != "" {
+				backends += ", "
+			}
+			backends += name + "=" + cfg.AIUpstreams[name]
+		}
+		log.Printf("cs-proxy %s: ai edge backends=%s key=%s keys_file=%s allowed_ip=%s\n",
+			version, backends, keyLog, cfg.AIKeysFile, cfg.AIAllowedIP)
 		if cfg.AIListenHTTP != "" && cfg.AIListenHTTP != "0" {
 			go func() {
 				addr := cfg.AIListenAddr + ":" + cfg.AIListenHTTP

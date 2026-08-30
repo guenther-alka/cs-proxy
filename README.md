@@ -60,11 +60,17 @@ ai = off                       # off disables the AI listener
 ai_listen_addr = 0.0.0.0
 ai_listen_http = 0             # 0 = no plain HTTP (recommended)
 ai_listen_https = 8443
-ai_upstream = http://127.0.0.1:8080   # llama-server / Ollama base URL
-ai_key = <secret>              # optional Bearer token (constant-time compare)
+ai_upstream = http://127.0.0.1:8080   # default backend (no prefix)
+ai_upstream_ollama = http://127.0.0.1:11434   # named backend -> /ollama/...
+ai_keys_file = _cfg/cs-proxy.keys     # Bearer keys, one per line; hot-reloaded
 ai_allowed_ip = 192.168.2.0/24,10.0.0.5   # optional IP/CIDR allowlist
+ai_upstream_key =               # optional: Bearer injected to backends (edge key stripped)
 ai_cert =                      # optional cert for the AI HTTPS listener
 ai_key_file =                  # optional key (else shared cs-proxy-cert.pem)
+
+# --- optional web GUI hardening ---
+proxy_allowed_ip = 192.168.2.0/24   # GUI edge IP/CIDR allowlist (remote only;
+                                    # loopback + /ping always allowed)
 ```
 
 - **Upstream port is derived from `http_port`** -- the proxy always follows
@@ -92,27 +98,48 @@ edge; combine both flags to run both edges):
 
 ```sh
 cs-proxy --ai-forward http://127.0.0.1:8080 --ai-http 11434 --ai-https 8443 \
-         --ai-addr 0.0.0.0 --ai-key <secret> --ai-allowed-ip 192.168.2.0/24
+         --ai-addr 0.0.0.0 --ai-keys-file _cfg/cs-proxy.keys \
+         --allowed-ai 192.168.2.0/24 --allowed-proxy 192.168.2.0/24
 ```
 
-AI switches: `-ai-forward <url>` (upstream + enables the AI listener),
-`-ai-http <port>`, `-ai-https <port>`, `-ai-addr <host>`, `-ai-key <token>`,
-`-ai-allowed-ip <ip/cidr,...>`.
+AI switches: `-ai-forward <url>` (default upstream + enables the AI listener),
+`-ai-http <port>`, `-ai-https <port>`, `-ai-addr <host>`, `-ai-keys-file <f>`,
+`-allowed-ai <ip/cidr,...>` (alias `-ai-allowed-ip`), `-allowed-proxy <list>`.
 
 ## AI edge (local LLM reverse proxy)
 
-Serves an OpenAI-compatible LLM backend (llama-server `/v1/*`, Ollama `/api/*`)
+Serves OpenAI-compatible LLM backends (llama-server `/v1/*`, Ollama `/api/*`)
 through cs-proxy on its own listener, so external clients never touch the raw
 backend port:
 
+- **Backend selection by path prefix**: `ai_upstream` is the default backend
+  (no prefix); every `ai_upstream_<name>` is routed under `/<name>/`, e.g.
+  `https://host:8443/ollama/v1/chat/completions` reaches Ollama while
+  `https://host:8443/v1/chat/completions` reaches the default (llama-server).
+  Both can run side by side; the client just picks the prefix.
+- **Key list**: `ai_keys_file` (`_cfg/cs-proxy.keys`) holds the Bearer keys --
+  one per line, `#` comments, optional `key = label` (label is display-only).
+  Keys are **hot-reloaded on change** (GUI add/del works without a restart).
+  `ai_key` is deprecated (still accepted, prints a warning).
 - **Auth is only on the AI listener** -- the web GUI listener keeps its
-  existing behavior (no cookie/Bearer conflict). `ai_key` enforces a Bearer
-  token (constant-time compare), `ai_allowed_ip` restricts client IPs/CIDRs;
-  both are optional and can be combined.
+  existing behavior (no cookie/Bearer conflict). `ai_allowed_ip` restricts
+  client IPs/CIDRs; both are optional and can be combined.
+- **Auth strip + injection**: the client's `Authorization` header never
+  reaches the backend (it is removed before the upstream hop, so the edge key
+  stays out of LLM logs). If a backend needs its own key, `ai_upstream_key`
+  re-injects `Authorization: Bearer <ai_upstream_key>` to every backend.
+- **Aggregated `/v1/models`**: with more than one backend, `GET /v1/models`
+  on the AI listener merges all backends' model lists and prefixes the ids
+  with the backend name (`ollama/llama3.1`), plus `x_csproxy_backend` /
+  `x_csproxy_endpoint` hints for a GUI model dropdown. Cached 10s.
 - **Streaming works out of the box**: `FlushInterval = -1` passes SSE/token
   chunks through without buffering.
 - **Cert**: the AI HTTPS listener uses `ai_cert`/`ai_key_file` when set, else
   the shared generated `_cfg/cs-proxy-cert.pem` (same as the GUI edge).
+- **Web GUI hardening**: `proxy_allowed_ip` blocks remote GUI clients outside
+  the IP/CIDR list with 403 (loopback and `/ping` are always allowed, so local
+  admin and the monitor.pl watchdog keep working) -- e.g. dual-NIC setups
+  where the AI listener is public but the web GUI is internal-only.
 - Logged with the note column `ai`, e.g.
   `HTTP 200 POST /v1/chat/completions 10.0.0.5 8123ms ai` (rejections too).
 

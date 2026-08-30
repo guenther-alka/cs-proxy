@@ -28,6 +28,8 @@ type App struct {
 	docroot     string
 	docrootReal string // resolved symlinks (for containment checks)
 	certDir     string
+	allowed     []*net.IPNet // GUI edge IP/CIDR allowlist (remote only)
+	allowedIP   []net.IP
 }
 
 func newApp(cfg Config) *App {
@@ -60,6 +62,7 @@ func newApp(cfg Config) *App {
 	if res, err := filepath.EvalSymlinks(cfg.Docroot); err == nil {
 		docrootReal = res
 	}
+	allowed, allowedIP := parseAllowedIPs(cfg.ProxyAllowedIP)
 	return &App{
 		cfg:         cfg,
 		proxy:       rp,
@@ -67,6 +70,8 @@ func newApp(cfg Config) *App {
 		docroot:     cfg.Docroot,
 		docrootReal: docrootReal,
 		certDir:     certDir,
+		allowed:     allowed,
+		allowedIP:   allowedIP,
 	}
 }
 
@@ -212,6 +217,16 @@ func (a *App) route(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(path, "/closeme_") {
 		http.Error(w, "Forbidden\n", http.StatusForbidden)
 		return
+	}
+
+	// GUI edge IP/CIDR allowlist (proxy_allowed_ip). Remote clients outside
+	// the list are blocked with 403; loopback is always allowed (local admin,
+	// monitor.pl watchdog on /ping). /ping + /healthz stay exempt above.
+	if len(a.allowed) > 0 || len(a.allowedIP) > 0 {
+		if !isLoopback(remote) && !ipAllowed(remote, a.allowed, a.allowedIP) {
+			http.Error(w, "Forbidden\n", http.StatusForbidden)
+			return
+		}
 	}
 
 	// HTTP (port 80) from a REMOTE client: forcibly forward to the edge's
