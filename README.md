@@ -62,9 +62,9 @@ ai_listen_http = 0             # 0 = no plain HTTP (recommended)
 ai_listen_https = 8443
 ai_upstream = http://127.0.0.1:8080   # default backend (no prefix)
 ai_upstream_ollama = http://127.0.0.1:11434   # named backend -> /ollama/...
-ai_keys_file = _cfg/cs-proxy.keys     # Bearer keys, one per line; hot-reloaded
+ai_keys_file = _cfg/cs-proxy.keys     # API keys, one per line; hot-reloaded (sent as Bearer)
 ai_allowed_ip = 192.168.2.0/24,10.0.0.5   # optional IP/CIDR allowlist
-ai_upstream_key =               # optional: Bearer injected to backends (edge key stripped)
+ai_upstream_key =               # optional: API key injected to backends (as Bearer; edge key stripped)
 ai_cert =                      # optional cert for the AI HTTPS listener
 ai_key_file =                  # optional key (else shared cs-proxy-cert.pem)
 
@@ -117,12 +117,12 @@ backend port:
   `https://host:8443/ollama/v1/chat/completions` reaches Ollama while
   `https://host:8443/v1/chat/completions` reaches the default (llama-server).
   Both can run side by side; the client just picks the prefix.
-- **Key list**: `ai_keys_file` (`_cfg/cs-proxy.keys`) holds the Bearer keys --
+- **Key list**: `ai_keys_file` (`_cfg/cs-proxy.keys`) holds the API keys --
   one per line, `#` comments, optional `key = label` (label is display-only).
   Keys are **hot-reloaded on change** (GUI add/del works without a restart).
   `ai_key` is deprecated (still accepted, prints a warning).
 - **Auth is only on the AI listener** -- the web GUI listener keeps its
-  existing behavior (no cookie/Bearer conflict). `ai_allowed_ip` restricts
+  existing behavior (no cookie/API-key conflict). `ai_allowed_ip` restricts
   client IPs/CIDRs; both are optional and can be combined.
 - **Auth strip + injection**: the client's `Authorization` header never
   reaches the backend (it is removed before the upstream hop, so the edge key
