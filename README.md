@@ -24,6 +24,10 @@ browser ──HTTPS/HTTP──▶ cs-proxy (Go, ports 80/443)
                           ├─ dynamic: reverse-proxies /cgi-bin/* (SSE/upload streamed)
                           └─ /ping,/healthz for monitor.pl watchdog
 webserver.pl -worker ◀── loopback 127.0.0.1:8001 (dynamic only, no TLS, no static)
+
+AI clients ──HTTPS/HTTP──▶ cs-proxy ai edge (optional, ai_listen_http/https)
+                            └─ reverse-proxies to the local LLM backend
+                               (llama-server / Ollama, ai_upstream)
 ```
 
 ## Config
@@ -48,6 +52,19 @@ proxy_cache = on
 proxy_cache_max_mb = 64
 proxy_cache_ttl_s = 60
 proxy_compress = gzip
+
+# --- optional AI edge (local LLM reverse proxy) ---
+# One instance can run both edges: the web GUI (80/443) and the AI listener
+# (its own ports) side by side. proxy=off + ai=on = dedicated AI server.
+ai = off                       # off disables the AI listener
+ai_listen_addr = 0.0.0.0
+ai_listen_http = 0             # 0 = no plain HTTP (recommended)
+ai_listen_https = 8443
+ai_upstream = http://127.0.0.1:8080   # llama-server / Ollama base URL
+ai_key = <secret>              # optional Bearer token (constant-time compare)
+ai_allowed_ip = 192.168.2.0/24,10.0.0.5   # optional IP/CIDR allowlist
+ai_cert =                      # optional cert for the AI HTTPS listener
+ai_key_file =                  # optional key (else shared cs-proxy-cert.pem)
 ```
 
 - **Upstream port is derived from `http_port`** -- the proxy always follows
@@ -70,6 +87,35 @@ cs-proxy --forward http://127.0.0.1:9000 --http 8080 --https 8443 --addr 0.0.0.0
 Switches: `-conf`/`-config <file>`, `-forward <url>` (upstream override),
 `-http <port>`, `-https <port>`, `-addr <host>`.
 
+A dedicated AI server is equally simple (`--ai-forward` alone disables the web
+edge; combine both flags to run both edges):
+
+```sh
+cs-proxy --ai-forward http://127.0.0.1:8080 --ai-http 11434 --ai-https 8443 \
+         --ai-addr 0.0.0.0 --ai-key <secret> --ai-allowed-ip 192.168.2.0/24
+```
+
+AI switches: `-ai-forward <url>` (upstream + enables the AI listener),
+`-ai-http <port>`, `-ai-https <port>`, `-ai-addr <host>`, `-ai-key <token>`,
+`-ai-allowed-ip <ip/cidr,...>`.
+
+## AI edge (local LLM reverse proxy)
+
+Serves an OpenAI-compatible LLM backend (llama-server `/v1/*`, Ollama `/api/*`)
+through cs-proxy on its own listener, so external clients never touch the raw
+backend port:
+
+- **Auth is only on the AI listener** -- the web GUI listener keeps its
+  existing behavior (no cookie/Bearer conflict). `ai_key` enforces a Bearer
+  token (constant-time compare), `ai_allowed_ip` restricts client IPs/CIDRs;
+  both are optional and can be combined.
+- **Streaming works out of the box**: `FlushInterval = -1` passes SSE/token
+  chunks through without buffering.
+- **Cert**: the AI HTTPS listener uses `ai_cert`/`ai_key_file` when set, else
+  the shared generated `_cfg/cs-proxy-cert.pem` (same as the GUI edge).
+- Logged with the note column `ai`, e.g.
+  `HTTP 200 POST /v1/chat/completions 10.0.0.5 8123ms ai` (rejections too).
+
 ## Console output
 
 cs-proxy logs every request to its console (stdout/stderr) in the same format
@@ -84,8 +130,9 @@ per component):
 ```
 
 Note column: `ping` / `root` / `proxy` (upstream) / `static` (served from
-docroot). Startup lines (`docroot=... upstream=... HTTP/HTTPS listening`)
-and TLS handshake errors go to the same console.
+docroot) / `ai` (AI edge). Startup lines (`docroot=... upstream=...
+HTTP/HTTPS listening`, `ai edge upstream=...`) and TLS handshake errors go to
+the same console.
 
 ## Mode integration (start.pl / monitor.pl)
 

@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-var version = "0.9"
+var version = "0.10"
 
 type Config struct {
 	Enabled     bool
@@ -44,6 +44,19 @@ type Config struct {
 	CacheTTLS  int
 
 	Compress string // "", "gzip", "gzip,brotli"
+
+	// Optional AI edge (local LLM reverse proxy, e.g. llama-server / Ollama).
+	// Listens on its own ports (ai_listen_http/https) and forwards everything
+	// to ai_upstream. Optional auth: ai_key (Bearer) + ai_allowed_ip (IP/CIDR).
+	AIEnabled     bool
+	AIListenAddr  string
+	AIListenHTTP  string
+	AIListenHTTPS string
+	AIUpstream    string
+	AIKey         string
+	AIAllowedIP   string
+	AICertFile    string
+	AIKeyFile     string
 }
 
 func defaultConfig() Config {
@@ -62,6 +75,16 @@ func defaultConfig() Config {
 		CacheTTLS:  60,
 
 		Compress: "gzip",
+
+		AIEnabled:     false,
+		AIListenAddr:  "0.0.0.0",
+		AIListenHTTP:  "0", // "0" = HTTP listener off
+		AIListenHTTPS: "8443",
+		AIUpstream:    "",
+		AIKey:         "",
+		AIAllowedIP:   "",
+		AICertFile:    "",
+		AIKeyFile:     "",
 	}
 }
 
@@ -145,6 +168,25 @@ func loadConfig(path string) (Config, error) {
 			fmt.Sscanf(v, "%d", &cfg.CacheTTLS)
 		case "proxy_compress":
 			cfg.Compress = strings.ToLower(v)
+		// optional AI edge (local LLM reverse proxy)
+		case "ai":
+			cfg.AIEnabled = on(v)
+		case "ai_listen_addr":
+			cfg.AIListenAddr = v
+		case "ai_listen_http":
+			cfg.AIListenHTTP = v
+		case "ai_listen_https":
+			cfg.AIListenHTTPS = v
+		case "ai_upstream":
+			cfg.AIUpstream = v
+		case "ai_key":
+			cfg.AIKey = v
+		case "ai_allowed_ip":
+			cfg.AIAllowedIP = v
+		case "ai_cert":
+			cfg.AICertFile = v
+		case "ai_key_file":
+			cfg.AIKeyFile = v
 		// shared keys (also used by webserver.pl)
 		case "http_port":
 			httpPort = v
@@ -190,7 +232,7 @@ func loadConfig(path string) (Config, error) {
 	if !filepath.IsAbs(cfg.Docroot) {
 		cfg.Docroot = filepath.Join(dir, cfg.Docroot)
 	}
-	for _, p := range []*string{&cfg.CertFile, &cfg.KeyFile} {
+	for _, p := range []*string{&cfg.CertFile, &cfg.KeyFile, &cfg.AICertFile, &cfg.AIKeyFile} {
 		if *p != "" && !filepath.IsAbs(*p) {
 			*p = filepath.Join(dir, *p)
 		}
@@ -202,12 +244,20 @@ func main() {
 	var cfgPath string
 	var forward string
 	var listenHTTP, listenHTTPS, listenAddr string
+	var aiForward string
+	var aiHTTP, aiHTTPS, aiAddr, aiKey, aiAllowedIP string
 	flag.StringVar(&cfgPath, "config", "", "path to config file (default: _cfg/webserver/webserver.conf next to the binary)")
 	flag.StringVar(&cfgPath, "conf", "", "alias for -config")
 	flag.StringVar(&forward, "forward", "", "upstream URL to reverse-proxy to (standalone/universal mode; overrides config)")
 	flag.StringVar(&listenHTTP, "http", "", "HTTP listen port (overrides config; standalone convenience)")
 	flag.StringVar(&listenHTTPS, "https", "", "HTTPS listen port (overrides config; standalone convenience)")
 	flag.StringVar(&listenAddr, "addr", "", "listen address (overrides config; standalone convenience)")
+	flag.StringVar(&aiForward, "ai-forward", "", "AI edge upstream URL (local LLM reverse proxy; enables the AI listener)")
+	flag.StringVar(&aiHTTP, "ai-http", "", "AI HTTP listen port (0 = off; overrides config)")
+	flag.StringVar(&aiHTTPS, "ai-https", "", "AI HTTPS listen port (0 = off; overrides config)")
+	flag.StringVar(&aiAddr, "ai-addr", "", "AI listen address (overrides config)")
+	flag.StringVar(&aiKey, "ai-key", "", "AI edge Bearer token (optional)")
+	flag.StringVar(&aiAllowedIP, "ai-allowed-ip", "", "AI edge client IP/CIDR allowlist (comma separated; optional)")
 	flag.Parse()
 
 	if cfgPath == "" {
@@ -236,37 +286,119 @@ func main() {
 	if listenAddr != "" {
 		cfg.ListenAddr = listenAddr
 	}
+	// AI edge overrides (standalone convenience for a dedicated AI server).
+	// ai-forward alone = AI-only (no GUI edge); both --forward and --ai-forward
+	// = both edges; the SOHO "both in one instance" mode normally comes from
+	// the config file (proxy=on + ai=on).
+	if aiForward != "" {
+		cfg.AIEnabled = true
+		cfg.AIUpstream = aiForward
+		if forward == "" {
+			cfg.Enabled = false
+		}
+	}
+	if aiHTTP != "" {
+		cfg.AIListenHTTP = aiHTTP
+	}
+	if aiHTTPS != "" {
+		cfg.AIListenHTTPS = aiHTTPS
+	}
+	if aiAddr != "" {
+		cfg.AIListenAddr = aiAddr
+	}
+	if aiKey != "" {
+		cfg.AIKey = aiKey
+	}
+	if aiAllowedIP != "" {
+		cfg.AIAllowedIP = aiAllowedIP
+	}
 
-	if !cfg.Enabled {
-		log.Printf("cs-proxy: proxy=off in %s -- not starting (webserver.pl serves directly)\n", cfgPath)
+	aiOn := cfg.AIEnabled && cfg.AIUpstream != ""
+	if !cfg.Enabled && !aiOn {
+		log.Printf("cs-proxy: proxy=off and ai=off in %s -- not starting (webserver.pl serves directly)\n", cfgPath)
 		return
 	}
 
 	app := newApp(cfg)
-	log.Printf("cs-proxy %s: docroot=%s upstream=%s\n", version, cfg.Docroot, cfg.Upstream)
+	if cfg.Enabled {
+		log.Printf("cs-proxy %s: web edge docroot=%s upstream=%s\n", version, cfg.Docroot, cfg.Upstream)
+	} else {
+		log.Printf("cs-proxy %s: web edge off (ai-only mode)\n", version)
+	}
 
-	// HTTP listener
-	go func() {
-		addr := cfg.ListenAddr + ":" + cfg.ListenHTTP
-		log.Printf("cs-proxy %s: HTTP listening on %s\n", version, addr)
-		srv := &http.Server{Addr: addr, Handler: app, ReadHeaderTimeout: 10 * time.Second}
-		if err := srv.ListenAndServe(); err != nil {
-			log.Printf("cs-proxy: HTTP on %s failed: %v\n", addr, err)
-			os.Exit(1)
+	// ---- GUI/web edge listeners (only when proxy=on) ----
+	if cfg.Enabled {
+		// HTTP listener ("0" or empty = off)
+		if cfg.ListenHTTP != "" && cfg.ListenHTTP != "0" {
+			go func() {
+				addr := cfg.ListenAddr + ":" + cfg.ListenHTTP
+				log.Printf("cs-proxy %s: HTTP listening on %s\n", version, addr)
+				srv := &http.Server{Addr: addr, Handler: app, ReadHeaderTimeout: 10 * time.Second}
+				if err := srv.ListenAndServe(); err != nil {
+					log.Printf("cs-proxy: HTTP on %s failed: %v\n", addr, err)
+					os.Exit(1)
+				}
+			}()
 		}
-	}()
+		// HTTPS listener ("0" or empty = off; self-signed cert if none configured)
+		if cfg.ListenHTTPS != "" && cfg.ListenHTTPS != "0" {
+			go func() {
+				tlsCfg, err := tlsConfigFor(app.certDir, cfg.CertFile, cfg.KeyFile)
+				if err != nil {
+					log.Printf("cs-proxy: TLS setup failed: %v\n", err)
+					os.Exit(1)
+				}
+				addr := cfg.ListenAddr + ":" + cfg.ListenHTTPS
+				log.Printf("cs-proxy %s: HTTPS listening on %s\n", version, addr)
+				srv := &http.Server{Addr: addr, Handler: app, TLSConfig: tlsCfg, ReadHeaderTimeout: 10 * time.Second}
+				if err := srv.ListenAndServeTLS("", ""); err != nil {
+					log.Printf("cs-proxy: HTTPS on %s failed: %v\n", addr, err)
+					os.Exit(1)
+				}
+			}()
+		}
+	}
 
-	// HTTPS listener (self-signed cert if none configured)
-	tlsCfg, err := app.tlsConfig()
-	if err != nil {
-		log.Printf("cs-proxy: TLS setup failed: %v\n", err)
-		os.Exit(1)
+	// ---- AI edge listeners (optional local LLM reverse proxy) ----
+	if aiOn {
+		edge := newAIEdge(cfg.AIUpstream)
+		edge.setKey(cfg.AIKey)
+		edge.setAllowed(cfg.AIAllowedIP)
+		keyLog := "off"
+		if cfg.AIKey != "" {
+			keyLog = "on"
+		}
+		log.Printf("cs-proxy %s: ai edge upstream=%s key=%s allowed_ip=%s\n",
+			version, cfg.AIUpstream, keyLog, cfg.AIAllowedIP)
+		if cfg.AIListenHTTP != "" && cfg.AIListenHTTP != "0" {
+			go func() {
+				addr := cfg.AIListenAddr + ":" + cfg.AIListenHTTP
+				log.Printf("cs-proxy %s: AI HTTP listening on %s\n", version, addr)
+				srv := &http.Server{Addr: addr, Handler: edge, ReadHeaderTimeout: 10 * time.Second}
+				if err := srv.ListenAndServe(); err != nil {
+					log.Printf("cs-proxy: AI HTTP on %s failed: %v\n", addr, err)
+					os.Exit(1)
+				}
+			}()
+		}
+		if cfg.AIListenHTTPS != "" && cfg.AIListenHTTPS != "0" {
+			go func() {
+				aiTLS, err := tlsConfigFor(app.certDir, cfg.AICertFile, cfg.AIKeyFile)
+				if err != nil {
+					log.Printf("cs-proxy: AI TLS setup failed: %v\n", err)
+					os.Exit(1)
+				}
+				addr := cfg.AIListenAddr + ":" + cfg.AIListenHTTPS
+				log.Printf("cs-proxy %s: AI HTTPS listening on %s\n", version, addr)
+				srv := &http.Server{Addr: addr, Handler: edge, TLSConfig: aiTLS, ReadHeaderTimeout: 10 * time.Second}
+				if err := srv.ListenAndServeTLS("", ""); err != nil {
+					log.Printf("cs-proxy: AI HTTPS on %s failed: %v\n", addr, err)
+					os.Exit(1)
+				}
+			}()
+		}
 	}
-	addr := cfg.ListenAddr + ":" + cfg.ListenHTTPS
-	log.Printf("cs-proxy %s: HTTPS listening on %s\n", version, addr)
-	srv := &http.Server{Addr: addr, Handler: app, TLSConfig: tlsCfg, ReadHeaderTimeout: 10 * time.Second}
-	if err := srv.ListenAndServeTLS("", ""); err != nil {
-		log.Printf("cs-proxy: HTTPS on %s failed: %v\n", addr, err)
-		os.Exit(1)
-	}
+
+	// keep the process alive (listeners are goroutines)
+	select {}
 }

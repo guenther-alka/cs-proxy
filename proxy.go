@@ -70,16 +70,18 @@ func newApp(cfg Config) *App {
 	}
 }
 
-// tlsConfig returns a TLS config, generating + persisting a self-signed cert
-// when none is configured (stable across restarts).
-func (a *App) tlsConfig() (*tls.Config, error) {
-	if a.cfg.CertFile != "" && a.cfg.KeyFile != "" {
-		if cert, err := tls.LoadX509KeyPair(a.cfg.CertFile, a.cfg.KeyFile); err == nil {
+// tlsConfigFor returns a TLS config for a listener, generating + persisting a
+// self-signed cert when none is configured (stable across restarts). The GUI
+// edge and the AI edge share the same generated cert (cs-proxy-cert.pem in
+// _cfg/) unless a listener-specific cert/key is configured.
+func tlsConfigFor(certDir, certFile, keyFile string) (*tls.Config, error) {
+	if certFile != "" && keyFile != "" {
+		if cert, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
 			return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}}, nil
 		}
 	}
-	certPath := filepath.Join(a.certDir, "cs-proxy-cert.pem")
-	keyPath := filepath.Join(a.certDir, "cs-proxy-key.pem")
+	certPath := filepath.Join(certDir, "cs-proxy-cert.pem")
+	keyPath := filepath.Join(certDir, "cs-proxy-key.pem")
 	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
 		return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}}, nil
 	}
@@ -87,7 +89,7 @@ func (a *App) tlsConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if os.MkdirAll(a.certDir, 0700) == nil {
+	if os.MkdirAll(certDir, 0700) == nil {
 		os.WriteFile(certPath, certPEM, 0600)
 		os.WriteFile(keyPath, keyPEM, 0600)
 	}
@@ -96,6 +98,12 @@ func (a *App) tlsConfig() (*tls.Config, error) {
 		return nil, err
 	}
 	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}}, nil
+}
+
+// tlsConfig for the GUI edge (uses the configured proxy cert/key, else the
+// shared generated cert). Kept for compatibility; listeners call tlsConfigFor.
+func (a *App) tlsConfig() (*tls.Config, error) {
+	return tlsConfigFor(a.certDir, a.cfg.CertFile, a.cfg.KeyFile)
 }
 
 func generateSelfSigned(host string) ([]byte, []byte, error) {
