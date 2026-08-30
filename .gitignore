@@ -1,0 +1,12 @@
+# built binaries
+/cs-proxy
+/cs-proxy.exe
+/dist/
+*.tar.gz
+
+# local TLS material / self-signed certs
+*.pem
+
+# editor / OS
+.DS_Store
+*.swp
