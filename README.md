@@ -1,6 +1,6 @@
 # cs-proxy
 
-HTTP/HTTPS edge for **napp-it cs** (csweb-gui). Serves the static document
+HTTP/HTTPS edge for **napp-it4ai** (client/server web-gui). Serves the static document
 root directly (gzip, ETag/304, in-memory LRU cache), terminates TLS, and
 reverse-proxies dynamic requests to a persistent Perl worker
 (`webserver.pl -worker`, loopback only) or the legacy webserver.
