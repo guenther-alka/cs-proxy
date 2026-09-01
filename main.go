@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-var version = "0.11.1"
+var version = "0.12.0"
 
 type Config struct {
 	Enabled     bool
@@ -88,7 +88,12 @@ func defaultConfig() Config {
 		AIListenAddr:  "0.0.0.0",
 		AIListenHTTP:  "0", // "0" = HTTP listener off
 		AIListenHTTPS: "8443",
-		AIUpstream:    "",
+		// "auto" = prefer a local llama-server, fall back to Ollama, live
+		// re-checked (see ai.go). So ai=on alone, with nothing else set,
+		// just works. Set ai_upstream=off to disable the default backend
+		// (named ai_upstream_<name> backends still work), or to a literal
+		// URL to forward there explicitly instead of auto-selecting.
+		AIUpstream:    "auto",
 		AIUpstreams:   map[string]string{},
 		AIUpstreamKey: "",
 		AIKeysFile:    "",
@@ -345,7 +350,13 @@ func main() {
 		cfg.ProxyAllowedIP = allowedProxy
 	}
 
-	aiOn := cfg.AIEnabled && (cfg.AIUpstream != "" || len(cfg.AIUpstreams) > 0)
+	// aiDefaultActive mirrors ai.go's newAIEdge(): "" or "off" = no default
+	// backend; "auto" or a literal URL both count as active.
+	aiDefaultActive := func(s string) bool {
+		s = strings.TrimSpace(s)
+		return s != "" && !strings.EqualFold(s, "off")
+	}
+	aiOn := cfg.AIEnabled && (aiDefaultActive(cfg.AIUpstream) || len(cfg.AIUpstreams) > 0)
 	if !cfg.Enabled && !aiOn {
 		log.Printf("cs-proxy: proxy=off and ai=off in %s -- not starting (webserver.pl serves directly)\n", cfgPath)
 		return

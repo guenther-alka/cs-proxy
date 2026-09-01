@@ -18,11 +18,14 @@ import (
 
 // aiBackend is one upstream of the AI edge. The default backend (ai_upstream)
 // has no prefix; named backends (ai_upstream_<name>) are routed under /<name>/.
+// proxy is an http.Handler so both a plain static *httputil.ReverseProxy and
+// the dynamic *autoUpstream (ai_upstream=auto) can serve as a backend.
 type aiBackend struct {
 name     string
 prefix   string // "/<name>" or ""
-upstream string
-proxy    *httputil.ReverseProxy
+upstream string // literal config value ("auto" for the dynamic backend)
+proxy    http.Handler
+auto     *autoUpstream // non-nil only for the ai_upstream=auto backend
 }
 
 func newBackend(name, prefix, upstream, injectKey string) *aiBackend {
@@ -67,6 +70,118 @@ return "(default)"
 return b.name
 }
 
+// resolvedUpstream returns the URL this backend is currently forwarding to.
+// For a static backend that is simply b.upstream; for the dynamic auto
+// backend it is whichever candidate is currently live (or "" if none is).
+func (b *aiBackend) resolvedUpstream() string {
+if b.auto != nil {
+return b.auto.resolvedURL()
+}
+return b.upstream
+}
+
+// -- ai_upstream=auto --------------------------------------------------
+//
+// Dynamic default backend: prefers a local llama-server, falls back to
+// Ollama, re-checked periodically (not just once at config-load time) so
+// starting/stopping either backend on the host is picked up live.
+
+const autoRecheckInterval = 5 * time.Second
+const autoProbeTimeout = 800 * time.Millisecond
+
+type autoCandidate struct {
+label string
+url   string
+proxy *httputil.ReverseProxy
+}
+
+type autoUpstream struct {
+candidates []*autoCandidate
+mu         sync.Mutex
+current    *autoCandidate
+checkedAt  time.Time
+}
+
+// newAutoUpstream builds the fixed candidate list in priority order:
+// llama-server (1st preference) then Ollama (2nd preference).
+func newAutoUpstream(injectKey string) *autoUpstream {
+mk := func(label, upstream string) *autoCandidate {
+b := newBackend("", "", upstream, injectKey)
+return &autoCandidate{label: label, url: upstream, proxy: b.proxy.(*httputil.ReverseProxy)}
+}
+return &autoUpstream{candidates: []*autoCandidate{
+mk("llama-server", "http://127.0.0.1:8080"),
+mk("ollama", "http://127.0.0.1:11434"),
+}}
+}
+
+// probeUp does a cheap TCP dial to check whether a candidate is listening.
+func probeUp(rawURL string) bool {
+u, err := url.Parse(rawURL)
+if err != nil || u.Host == "" {
+return false
+}
+conn, err := net.DialTimeout("tcp", u.Host, autoProbeTimeout)
+if err != nil {
+return false
+}
+conn.Close()
+return true
+}
+
+// pick returns the current candidate to use, re-probing at most once every
+// autoRecheckInterval. It prefers staying on the current pick (if still up)
+// over flapping back to a higher-priority candidate that just came back.
+func (a *autoUpstream) pick() *autoCandidate {
+a.mu.Lock()
+defer a.mu.Unlock()
+if a.current != nil && time.Since(a.checkedAt) < autoRecheckInterval {
+return a.current
+}
+a.checkedAt = time.Now()
+if a.current != nil && probeUp(a.current.url) {
+return a.current
+}
+for _, c := range a.candidates {
+if probeUp(c.url) {
+a.current = c
+return c
+}
+}
+a.current = nil
+return nil
+}
+
+func (a *autoUpstream) resolvedURL() string {
+c := a.pick()
+if c == nil {
+return ""
+}
+return c.url
+}
+
+func (a *autoUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+c := a.pick()
+if c == nil {
+names := make([]string, 0, len(a.candidates))
+for _, cc := range a.candidates {
+names = append(names, cc.label+" ("+cc.url+")")
+}
+w.Header().Set("X-CsProxy", "error")
+msg := "cs-proxy: ai_upstream=auto -- no backend reachable, tried: " + strings.Join(names, ", ") + "\n"
+http.Error(w, msg, http.StatusBadGateway)
+return
+}
+c.proxy.ServeHTTP(w, r)
+}
+
+// newAutoBackend wraps an autoUpstream as an aiBackend so it can sit in
+// aiEdge.defaultB / aiEdge.backends exactly like a static backend.
+func newAutoBackend(name, prefix, injectKey string) *aiBackend {
+au := newAutoUpstream(injectKey)
+return &aiBackend{name: name, prefix: prefix, upstream: "auto", proxy: au, auto: au}
+}
+
 // aiEdge is the optional local-LLM reverse proxy (llama-server / Ollama).
 // It listens on its own ports (ai_listen_http/https). Clients pick a backend
 // by path prefix (/<name>/...); the edge key (ai_keys_file, hot-reloaded) and
@@ -95,13 +210,27 @@ names = append(names, n)
 }
 sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
 for _, n := range names {
-e.backends = append(e.backends, newBackend(n, "/"+n, cfg.AIUpstreams[n], cfg.AIUpstreamKey))
+e.backends = append(e.backends, makeBackend(n, "/"+n, cfg.AIUpstreams[n], cfg.AIUpstreamKey))
 }
-if cfg.AIUpstream != "" {
-e.defaultB = newBackend("", "", cfg.AIUpstream, cfg.AIUpstreamKey)
+// ai_upstream: "" or "off" = no default backend (named backends, if any,
+// still work); "auto" = dynamic llama-server-then-Ollama backend, live
+// re-checked; anything else = static forward to that literal URL, exactly
+// as before -- explicit manual forwarding stays available alongside auto.
+mode := strings.TrimSpace(cfg.AIUpstream)
+if mode != "" && !strings.EqualFold(mode, "off") {
+e.defaultB = makeBackend("", "", cfg.AIUpstream, cfg.AIUpstreamKey)
 }
 e.setAllowed(cfg.AIAllowedIP)
 return e
+}
+
+// makeBackend builds a static or dynamic backend depending on whether
+// upstream is the literal "auto".
+func makeBackend(name, prefix, upstream, injectKey string) *aiBackend {
+if strings.EqualFold(strings.TrimSpace(upstream), "auto") {
+return newAutoBackend(name, prefix, injectKey)
+}
+return newBackend(name, prefix, upstream, injectKey)
 }
 
 func (e *aiEdge) setAllowed(s string) {
@@ -318,8 +447,12 @@ return true
 }
 
 func (e *aiEdge) fetchModels(b *aiBackend) []string {
+upstream := b.resolvedUpstream()
+if upstream == "" {
+return nil // auto backend with nothing reachable right now
+}
 client := &http.Client{Timeout: 5 * time.Second}
-resp, err := client.Get(b.upstream + "/v1/models")
+resp, err := client.Get(upstream + "/v1/models")
 if err != nil {
 return nil
 }
