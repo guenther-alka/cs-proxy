@@ -297,15 +297,29 @@ func isLoopback(ip string) bool {
 // handleRoot: HTTPS/loopback -> instant redirect to default_url. Remote
 // HTTP never reaches this handler (route() redirects it to https first).
 func (a *App) handleRoot(w http.ResponseWriter, r *http.Request, isHTTPS bool, remote string) {
-	def := a.defURLForHost(r.Host)
+	def := a.defURLForHost(r.Host, isHTTPS)
 	w.Header().Set("Location", def)
 	w.WriteHeader(http.StatusFound)
 }
 
-func (a *App) defURLForHost(host string) string {
+// defURLForHost builds the "/" redirect target. The normal case (DefaultURL
+// set from the shared default_url key, e.g. "/cgi-bin/admin.pl") is a
+// relative path, so scheme never enters into it. Fixed cs_rc_26.09.01 (Gea
+// review, finding #2): the fallback (DefaultURL empty -- standalone/
+// universal mode has no -default-url flag, so this is the only path there)
+// previously always built "http://"+host+"/" regardless of isHTTPS. An
+// HTTPS visitor hitting "/" with no default_url configured was silently
+// downgraded to plain HTTP -- which, for a REMOTE client, loops forever
+// against the http->https redirect above (https -> http -> https -> ...).
+// Preserve the scheme the client actually used instead.
+func (a *App) defURLForHost(host string, isHTTPS bool) string {
 	if a.cfg.DefaultURL != "" {
 		return a.cfg.DefaultURL
 	}
-	return "http://" + host + "/"
+	scheme := "http"
+	if isHTTPS {
+		scheme = "https"
+	}
+	return scheme + "://" + host + "/"
 }
 

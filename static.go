@@ -134,7 +134,7 @@ func (a *App) serveStatic(w http.ResponseWriter, r *http.Request, path string) b
 	key := path + "?" + r.URL.RawQuery
 	if !noCache {
 		if e, ok := a.cache.get(key); ok {
-			serveFromCache(w, r, e)
+			serveFromCache(w, r, e, a.cfg.Compress)
 			return true
 		}
 	}
@@ -155,7 +155,7 @@ func (a *App) serveStatic(w http.ResponseWriter, r *http.Request, path string) b
 	if !noCache && a.cfg.CacheOn {
 		a.cache.put(key, e)
 	}
-	serveFromCache(w, r, e)
+	serveFromCache(w, r, e, a.cfg.Compress)
 	return true
 }
 
@@ -171,7 +171,7 @@ func noCacheRequest(r *http.Request) bool {
 	return false
 }
 
-func serveFromCache(w http.ResponseWriter, r *http.Request, e *cacheEntry) {
+func serveFromCache(w http.ResponseWriter, r *http.Request, e *cacheEntry, compress string) {
 	if r.Header.Get("If-None-Match") == e.etag {
 		w.Header().Set("ETag", e.etag)
 		w.Header().Set("Cache-Control", "public, max-age="+fmt.Sprintf("%d", 0))
@@ -182,7 +182,7 @@ func serveFromCache(w http.ResponseWriter, r *http.Request, e *cacheEntry) {
 	w.Header().Set("Content-Type", e.ctype)
 	w.Header().Set("Last-Modified", e.modTime.UTC().Format(http.TimeFormat))
 	w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
-	gz := wantsGzip(r, e.ctype)
+	gz := wantsGzip(r, e.ctype, compress)
 	if gz {
 		w.Header().Set("Content-Encoding", "gzip")
 		gw := gzip.NewWriter(w)
@@ -194,7 +194,14 @@ func serveFromCache(w http.ResponseWriter, r *http.Request, e *cacheEntry) {
 	io.WriteString(w, string(e.data))
 }
 
-func wantsGzip(r *http.Request, ctype string) bool {
+// wantsGzip: fixed cs_rc_26.09.01 (Gea review, finding #1) -- proxy_compress
+// was parsed into cfg.Compress but never consulted here, so gzip ran
+// unconditionally whenever the client sent Accept-Encoding: gzip, no matter
+// what proxy_compress was set to (setting it empty/"off" had no effect).
+func wantsGzip(r *http.Request, ctype string, compress string) bool {
+	if !strings.Contains(strings.ToLower(compress), "gzip") {
+		return false
+	}
 	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		return false
 	}

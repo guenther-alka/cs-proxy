@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-var version = "0.11"
+var version = "0.11.1"
 
 type Config struct {
 	Enabled     bool
