@@ -19,14 +19,16 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
-var version = "0.12.0"
+var version = "0.12.1"
 
 type Config struct {
 	Enabled     bool
@@ -39,7 +41,7 @@ type Config struct {
 	KeyFile     string
 	DefaultURL  string
 
-	CacheOn   bool
+	CacheOn    bool
 	CacheMaxMB int64
 	CacheTTLS  int
 
@@ -253,11 +255,59 @@ func loadConfig(path string) (Config, error) {
 		}
 	}
 
+	// ---- legacy http_port migration (mirrors webserver.pl) ----------------
+	//
+	// Old webserver.conf files may still carry http_port = 80 (or the even
+	// older 8080 from the Caddy integration). webserver.pl rewrites those to
+	// 800 on disk -- but cs-proxy can start BEFORE it does so (monitor.pl's
+	// watchdog restarts the edge first on a fresh boot / after a config
+	// revert), and deriving the upstream from the stale value points the proxy
+	// at its OWN listener (127.0.0.1:80) -> endless self-proxy loop.
+	// (Confirmed live on Solaris 192.168.2.50 2026.09.18: cs-proxy 0.12.0
+	// logged "upstream=http://127.0.0.1:80" while its own HTTP listener was on
+	// 80 and webserver.pl listened on 800.)
+	legacyHTTPPort := httpPort == "80" || httpPort == "8080"
+	if legacyHTTPPort {
+		log.Printf("cs-proxy: WARNING %s has legacy http_port = %s -- using 800 (webserver.pl migrates the same way)\n", path, httpPort)
+		httpPort = "800"
+	}
+
 	// upstream: proxy_upstream/upstream override; default derives from
 	// webserver.conf http_port so the proxy always follows webserver.pl.
 	if !upstreamSet {
 		if _, err := strconv.Atoi(httpPort); err == nil {
 			cfg.Upstream = "http://127.0.0.1:" + httpPort
+		}
+	}
+
+	// ---- self-reference guard (REPAIR, never abort) -----------------------
+	//
+	// If the upstream points back at one of OUR OWN listeners, every dynamic
+	// request would be reverse-proxied onto itself forever. Instead of
+	// refusing to start, fix webserver.conf on disk (http_port -> 800, and a
+	// self-referencing proxy_upstream -> 127.0.0.1:800), log it, and carry on:
+	// a legacy/mistyped config is repaired rather than fatal, and the next
+	// restart already reads a correct file. webserver.pl keeps listening on
+	// 800 (it migrates http_port itself), so the repaired upstream is right.
+	if cfg.Enabled && upstreamIsSelf(cfg.Upstream, cfg) {
+		log.Printf("cs-proxy: WARNING upstream %s points back at this proxy's OWN listener (proxy_listen_http=%s/https=%s) -- repairing %s\n",
+			cfg.Upstream, cfg.ListenHTTP, cfg.ListenHTTPS, path)
+		cfg.Upstream = "http://127.0.0.1:800"
+		repair := map[string]string{"http_port": "800"}
+		if upstreamSet {
+			// explicit proxy_upstream was the culprit -> rewrite that key too
+			repair["proxy_upstream"] = "http://127.0.0.1:800"
+		}
+		if err := rewriteConfKV(path, repair); err != nil {
+			log.Printf("cs-proxy: WARNING could not rewrite %s: %v (continuing with upstream=%s)\n", path, err, cfg.Upstream)
+		} else {
+			log.Printf("cs-proxy: repaired %s -- upstream now http://127.0.0.1:800 (webserver.pl)\n", path)
+		}
+	} else if legacyHTTPPort {
+		if err := rewriteConfKV(path, map[string]string{"http_port": "800"}); err != nil {
+			log.Printf("cs-proxy: WARNING could not persist http_port = 800 to %s: %v\n", path, err)
+		} else {
+			log.Printf("cs-proxy: migrated %s on disk -- http_port is now 800\n", path)
 		}
 	}
 	if !filepath.IsAbs(cfg.Docroot) {
@@ -269,6 +319,61 @@ func loadConfig(path string) (Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// upstreamIsSelf reports whether the reverse-proxy target would loop back into
+// one of cs-proxy's OWN listeners (loopback host + a port this proxy itself
+// binds). Used by the self-reference guard in loadConfig().
+func upstreamIsSelf(upstream string, cfg Config) bool {
+	u, err := url.Parse(strings.TrimSpace(upstream))
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host != "" && host != "127.0.0.1" && host != "localhost" && host != "::1" && host != "0.0.0.0" {
+		return false // a real remote/sidecar upstream -- never a self-reference
+	}
+	port := u.Port()
+	if port == "" {
+		if strings.EqualFold(u.Scheme, "https") {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	for _, l := range []string{cfg.ListenHTTP, cfg.ListenHTTPS} {
+		if l != "" && l != "0" && l == port {
+			return true
+		}
+	}
+	return false
+}
+
+// rewriteConfKV replaces the value of EXISTING "key = value" lines in a flat
+// config file -- indentation and any trailing comment are preserved -- writing
+// atomically via a temp file + rename so a concurrently reading webserver.pl
+// can never see a half-written file. Keys that are absent are left alone:
+// appending would only add a second, conflicting line.
+func rewriteConfKV(path string, kv map[string]string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	out := string(data)
+	for k, v := range kv {
+		re := regexp.MustCompile(`(?m)^(\s*` + regexp.QuoteMeta(k) + `\s*=\s*)(\S+)`)
+		if re.MatchString(out) {
+			out = re.ReplaceAllString(out, "${1}"+v)
+		}
+	}
+	if out == string(data) {
+		return nil // nothing to rewrite
+	}
+	tmp := path + ".csproxy.tmp"
+	if err := os.WriteFile(tmp, []byte(out), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func main() {
