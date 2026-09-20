@@ -1,5 +1,12 @@
 # cs-proxy
 
+Signed-off-by: Guenther Alka gea@napp-it.org<br>
+Concept Co-Authored-By: Claude Fable 5 noreply@anthropic.com<br>
+
+Part of the [napp-it 4ai (client-server edition)](https://napp-it.org) cluster tooling family
+(alongside [cs-tools](https://www.napp-it.org/cs-tools_en.html))
+csweb-gui deploys and updates this manually per member menu About > Download cs-tools
+
 HTTP/HTTPS edge for **napp-it4ai** (client/server web-gui). Serves the static document
 root directly (gzip, ETag/304, in-memory LRU cache), terminates TLS, and
 reverse-proxies dynamic requests to a persistent Perl worker
