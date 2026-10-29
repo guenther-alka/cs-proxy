@@ -267,6 +267,14 @@ func (a *App) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// WebAssembly apps under /webcraft/ (directory index, wasm, gzip, caching)
+	if a.serveWebcraft(w, r, path) {
+		if sw, ok := w.(*statusWriter); ok {
+			sw.note = "webcraft"
+		}
+		return
+	}
+
 	// static: serve from the docroot if the file exists
 	if a.serveStatic(w, r, path) {
 		if sw, ok := w.(*statusWriter); ok {
