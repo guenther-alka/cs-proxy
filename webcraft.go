@@ -25,6 +25,7 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -128,6 +129,46 @@ func (a *App) insideRoot(root, full string) bool {
 	return true
 }
 
+// webcraftList answers /webcraft/index.json: JSON array of the installed apps
+// (sub folders with an index.html), alphabetically sorted. CORS-open so that
+// cs-team (other port = other origin) can list them.
+func (a *App) webcraftList(w http.ResponseWriter) {
+	seen := map[string]bool{}
+	var keys []string
+	for _, rt := range a.webcraftRoots() {
+		base := filepath.Join(rt, "webcraft")
+		ents, err := os.ReadDir(base)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			n := e.Name()
+			if seen[n] || strings.HasPrefix(n, ".") || !a.insideRoot(rt, filepath.Join(base, n)) {
+				continue
+			}
+			if st, err := os.Stat(filepath.Join(base, n, "index.html")); err != nil || st.IsDir() {
+				continue
+			}
+			seen[n] = true
+			keys = append(keys, n)
+		}
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteString("[")
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(fmt.Sprintf("%q", k))
+	}
+	sb.WriteString("]")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(sb.String()))
+}
+
 // serveWebcraft serves /webcraft/...; returns false when the request is not
 // for /webcraft/ or nothing was found (caller continues with the normal route).
 func (a *App) serveWebcraft(w http.ResponseWriter, r *http.Request, up string) bool {
@@ -137,6 +178,10 @@ func (a *App) serveWebcraft(w http.ResponseWriter, r *http.Request, up string) b
 	cu := pathpkg.Clean(up) // resolves ".." -- must still be inside /webcraft
 	if cu != webcraftPrefix && !strings.HasPrefix(cu, webcraftPrefix+"/") {
 		return false
+	}
+	if cu == webcraftPrefix+"/index.json" {
+		a.webcraftList(w)
+		return true
 	}
 	var root, full string
 	var fi os.FileInfo
