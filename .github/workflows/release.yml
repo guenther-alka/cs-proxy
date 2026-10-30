@@ -93,10 +93,20 @@ jobs:
           cd dist
           sha256sum *.tar.gz > checksums.txt
           cat checksums.txt
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          path: src
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v="${GITHUB_REF_NAME}"
+          awk -v h="## ${v}" '$0==h{f=1;next} /^## /{f=0} f' src/CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md" > notes.md
+          cat notes.md
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: notes.md
           files: |
             dist/*.tar.gz
             dist/checksums.txt
